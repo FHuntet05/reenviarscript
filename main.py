@@ -62,7 +62,7 @@ def print_progress_detailed(current, total, start_time, channel_name):
         f"Vel: {vpm:.1f} v/min | "
         f"ETA: {eta_str} | "
         f"Transcurrido: {elapsed_str}",
-        end=''
+        end='',
         flush=True
     )
     if current == total:
