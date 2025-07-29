@@ -63,6 +63,7 @@ def print_progress_detailed(current, total, start_time, channel_name):
         f"ETA: {eta_str} | "
         f"Transcurrido: {elapsed_str}",
         end=''
+        flush=True
     )
     if current == total:
         print()
