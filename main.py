@@ -1,204 +1,313 @@
-# main.py - Versión con Medidas de Seguridad Anti-Baneo Avanzadas
+# main.py
 import asyncio
 import os
-import re
+import json
 import time
-import pickle
-import random
-from datetime import datetime, timezone
+import logging
+import re
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Dict
+
 from telethon.sync import TelegramClient
 from telethon.errors.rpcerrorlist import FloodWaitError
 from telethon.sessions import StringSession
+from telethon.tl.types import Channel, Message
 
-# --- CONFIGURACIÓN DE SEGURIDAD (A TRAVÉS DE VARIABLES DE ENTORNO) ---
-API_ID = os.environ.get('API_ID')
-API_HASH = os.environ.get('API_HASH')
-SESSION_STRING = os.environ.get('SESSION_STRING')
-SOURCE_CHAT_IDS_STR = os.environ.get('SOURCE_CHAT_IDS')
-DESTINATION_CHAT_ID_STR = os.environ.get('DESTINATION_CHAT_ID')
+# --- CONFIGURACIÓN DE LOGGING ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-# Filtros
-MIN_VIDEO_SIZE_MB = 20
+# --- CLASE DE CONFIGURACIÓN (REDISEÑADA PARA ENRUTAMIENTO) ---
+@dataclass
+class Config:
+    api_id: int
+    api_hash: str
+    session_string: str
+    
+    # Mapeo de categorías a IDs de canal de destino
+    destination_channels: Dict[str, int]
+    
+    # Mapeo de IDs de canal de origen a su categoría principal
+    source_mapping: Dict[int, str]
+    
+    sleep_interval_seconds: int = 5 * 60 * 60
 
-# 1. Ritmo "Humano" (Pausas aleatorias entre cada video)
-MIN_DELAY_SECONDS = int(os.environ.get('MIN_DELAY_SECONDS', 5))
-MAX_DELAY_SECONDS = int(os.environ.get('MAX_DELAY_SECONDS', 15))
-
-# 2. Descansos por Lotes
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 75))
-MIN_BATCH_BREAK_MINUTES = int(os.environ.get('MIN_BATCH_BREAK_MINUTES', 15))
-MAX_BATCH_BREAK_MINUTES = int(os.environ.get('MAX_BATCH_BREAK_MINUTES', 30))
-
-# 3. "Modo Noche" (El bot duerme)
-SLEEP_START_HOUR_UTC = int(os.environ.get('SLEEP_START_HOUR_UTC', 23)) # 11 PM UTC
-SLEEP_END_HOUR_UTC = int(os.environ.get('SLEEP_END_HOUR_UTC', 7))     # 7 AM UTC
-
-# --- VALIDACIÓN Y GESTIÓN DE ESTADO (Sin cambios) ---
-# ... (Se mantiene el código de validación, load/save processed_videos, clean_caption, y las funciones de interfaz)
-if not all([API_ID, API_HASH, SESSION_STRING, SOURCE_CHAT_IDS_STR, DESTINATION_CHAT_ID_STR]):
-    raise ValueError("Faltan una o más variables de entorno requeridas.")
-try:
-    SOURCE_CHAT_IDS = [int(chat_id.strip()) for chat_id in SOURCE_CHAT_IDS_STR.split(',')]
-    DESTINATION_CHAT_ID = int(DESTINATION_CHAT_ID_STR)
-    API_ID = int(API_ID)
-except ValueError:
-    raise ValueError("Los IDs de canal y el API_ID deben ser números enteros.")
-
-PROCESSED_VIDEOS_FILE = 'processed_videos.dat'
-
-def load_processed_videos():
-    try:
-        with open(PROCESSED_VIDEOS_FILE, 'rb') as f:
-            return pickle.load(f)
-    except (FileNotFoundError, EOFError):
-        return set()
-
-def save_processed_videos(processed_set):
-    with open(PROCESSED_VIDEOS_FILE, 'wb') as f:
-        pickle.dump(processed_set, f)
-
-def clean_caption(text):
-    if not text: return ""
-    text = re.sub(r'https?://\S+|www\.\S+|t\.me/\S+', '', text)
-    text = re.sub(r'@\w+', '', text)
-    emoji_pattern = re.compile(
-        "["
-        "\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F700-\U0001F77F"
-        "\U0001F780-\U0001F7FF\U0001F800-\U0001F8FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F"
-        "\U0001FA70-\U0001FAFF\U00002702-\U000027B0\U000024C2-\U0001F251"
-        "]+", flags=re.UNICODE)
-    text = emoji_pattern.sub(r'', text)
-    text = re.sub(r'\s{2,}', ' ', text); text = re.sub(r'(\n\s*){2,}', '\n\n', text)
-    return text.strip()
-
-def print_progress_detailed(current, total, start_time, channel_name):
-    if total == 0: return
-    progress_percentage = current / total; bar_length = 25
-    filled_length = int(bar_length * progress_percentage); bar = '█' * filled_length + '─' * (bar_length - filled_length)
-    elapsed_time = time.time() - start_time; vpm = (current / elapsed_time) * 60 if elapsed_time > 0 else 0
-    time_per_item = elapsed_time / current if current > 0 else 0; remaining_time = time_per_item * (total - current)
-    elapsed_str = time.strftime('%H:%M:%S', time.gmtime(elapsed_time)); eta_str = time.strftime('%H:%M:%S', time.gmtime(remaining_time))
-    print(f"\r[ {channel_name[:20]:<20} ] {bar} {current}/{total} ({progress_percentage:.1%}) | Vel: {vpm:.1f} v/min | ETA: {eta_str} | Transcurrido: {elapsed_str}", end='', flush=True)
-    if current == total: print()
-
-async def send_chapter_header(client, dest_entity, channel_name, channel_id):
-    header_text = (f"╭─── • ◆ • ───╮\n  COMENZANDO RECOPILACIÓN\n╰─── • ◆ • ───╯\n\n"
-                   f"📁 **Origen:** `{channel_name}`\n🆔 **ID:** `{channel_id}`")
-    await client.send_message(dest_entity, header_text, parse_mode='md')
-
-async def send_chapter_footer(client, dest_entity, channel_name, count):
-    footer_text = (f"╭─── • ◆ • ───╮\n  RECOPILACIÓN FINALIZADA\n╰─── • ◆ • ───╯\n\n"
-                   f"✅ Se transfirieron **{count}** videos desde `{channel_name}`.")
-    await client.send_message(dest_entity, footer_text, parse_mode='md')
-
-
-# --- NUEVA FUNCIÓN DE SEGURIDAD: MODO NOCHE ---
-def is_sleep_time():
-    """Verifica si la hora actual UTC está dentro del rango de sueño."""
-    now_utc = datetime.now(timezone.utc)
-    start = SLEEP_START_HOUR_UTC
-    end = SLEEP_END_HOUR_UTC
-
-    # Maneja el caso en que el rango cruza la medianoche (ej: 23:00 a 07:00)
-    if start > end:
-        return now_utc.hour >= start or now_utc.hour < end
-    else:
-        return start <= now_utc.hour < end
-
-# --- FUNCIÓN PRINCIPAL MODIFICADA ---
-async def main():
-    print("🚀 Iniciando cliente de Telegram en MODO SEGURO...")
-    async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
-        # ... (código de conexión y verificación de entidades sin cambios)
-        me = await client.get_me(); print(f"✅ Cliente conectado como: {me.first_name}\n")
+    @classmethod
+    def from_env(cls):
+        """Carga toda la configuración desde las variables de entorno."""
         try:
-            dest_entity = await client.get_entity(DESTINATION_CHAT_ID)
-            print(f"🎯 Canal de destino: {getattr(dest_entity, 'title', dest_entity.id)}\n")
-        except Exception as e:
-            print(f"❌ Error fatal al encontrar el canal de destino: {e}"); return
-        source_entities = []
-        print("📡 Verificando canales de origen...")
-        for source_id in SOURCE_CHAT_IDS:
-            try:
-                entity = await client.get_entity(source_id); source_entities.append(entity)
-                print(f"  -> ✅ Encontrado: {getattr(entity, 'title', entity.id)}")
-            except Exception as e:
-                print(f"  -> ⚠️  Advertencia al buscar {source_id}: {e}")
-        if not source_entities: print("❌ Error fatal: No se encontró ningún canal de origen válido."); return
-        
-        # El ciclo principal ahora se ejecuta indefinidamente, pero con pausas
-        while True:
-            # --- VERIFICACIÓN DE MODO NOCHE ---
-            if is_sleep_time():
-                print(f"🌙 Modo Noche activado. El bot está durmiendo hasta las {SLEEP_END_HOUR_UTC}:00 UTC. Próxima verificación en 15 minutos...")
-                await asyncio.sleep(900) # Espera 15 minutos antes de volver a chequear
-                continue # Salta el resto del ciclo y vuelve a chequear la hora
+            api_id = int(os.environ['API_ID'])
+            api_hash = os.environ['API_HASH']
+            session_string = os.environ['SESSION_STRING']
+        except KeyError as e:
+            raise ValueError(f"❌ Variable de entorno básica faltante: {e}")
+        except ValueError:
+            raise ValueError("❌ API_ID debe ser un número entero.")
 
-            print("\n" + "="*60); print(f"🔄 Iniciando nuevo ciclo de escaneo: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            processed_videos = load_processed_videos()
-            
-            for source_entity in source_entities:
-                # ... (lógica de escaneo y filtrado sin cambios)
-                channel_name = getattr(source_entity, 'title', f"ID:{source_entity.id}")
-                print(f"\n🔎 Escaneando canal: '{channel_name}'")
-                videos_to_process = []
+        # 1. Cargar destinos
+        dest_channels = {}
+        # Categorías que esperamos encontrar.
+        CATEGORIES = ['MOVIES', 'SERIES', 'ANIME', 'DORAMAS', 'RETRO_TV', 'MIXED_UNSORTED']
+        for category in CATEGORIES:
+            env_var = f'{category}_DEST_ID'
+            dest_id_str = os.environ.get(env_var)
+            if dest_id_str:
                 try:
-                    async for msg in client.iter_messages(source_entity):
-                        if (msg.video and msg.id not in processed_videos and msg.video.size > MIN_VIDEO_SIZE_MB * 1024 * 1024):
-                            videos_to_process.append(msg)
-                except Exception as e:
-                    print(f"  -> ❌ Error al escanear: {e}"); continue
-                if not videos_to_process:
-                    print(f"  -> No se encontraron videos nuevos o mayores a {MIN_VIDEO_SIZE_MB}MB."); continue
-                
-                videos_to_process.sort(key=lambda m: m.text if m.text else '')
-                total_to_process = len(videos_to_process)
-                print(f"  -> {total_to_process} videos nuevos para procesar. Iniciando...")
-                await send_chapter_header(client, dest_entity, channel_name, source_entity.id)
-                start_time = time.time()
-                
-                for i, message in enumerate(videos_to_process, start=1):
-                    # --- REVISIÓN DE MODO NOCHE DENTRO DEL BUCLE ---
-                    if is_sleep_time():
-                        print("\n🌙 Se activó el Modo Noche durante un lote. Pausando hasta la mañana...")
-                        break # Rompe el bucle del lote actual para entrar en modo sueño
+                    dest_channels[category.upper()] = int(dest_id_str)
+                except ValueError:
+                    raise ValueError(f"El ID para {env_var} no es un número entero válido.")
+        
+        if not dest_channels:
+            raise ValueError("❌ No se ha configurado ningún canal de destino (ej. MOVIES_DEST_ID).")
+        if 'MIXED_UNSORTED' not in dest_channels:
+            raise ValueError("❌ Es obligatorio configurar 'MIXED_UNSORTED_DEST_ID' como canal de fallback.")
 
-                    try:
-                        print_progress_detailed(i, total_to_process, start_time, channel_name)
-                        original_caption = message.text; cleaned_caption = clean_caption(original_caption)
-                        
-                        await client.send_file(dest_entity, message.media, caption=cleaned_caption, supports_streaming=True)
-                        
-                        processed_videos.add(message.id)
-                        
-                        # --- PAUSA ALEATORIA "HUMANA" ---
-                        human_like_delay = random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS)
-                        await asyncio.sleep(human_like_delay)
+        # 2. Cargar y mapear orígenes
+        source_map = {}
+        # Lista de posibles categorías de origen
+        SOURCE_CATEGORIES = ['MOVIES', 'SERIES', 'ANIME', 'DORAMAS', 'RETRO_TV', 'MIXED']
+        for category in SOURCE_CATEGORIES:
+            env_var = f'{category}_SOURCE_IDS'
+            source_ids_str = os.environ.get(env_var)
+            if source_ids_str:
+                try:
+                    source_ids = [int(sid.strip()) for sid in source_ids_str.split(',')]
+                    for sid in source_ids:
+                        source_map[sid] = category.upper() # Mapea el ID de origen a su categoría
+                except ValueError:
+                    raise ValueError(f"Los IDs en {env_var} deben ser números enteros separados por comas.")
 
-                        # --- DESCANSO DE LOTE ---
-                        if i % BATCH_SIZE == 0 and i < total_to_process:
-                            batch_break_minutes = random.uniform(MIN_BATCH_BREAK_MINUTES, MAX_BATCH_BREAK_MINUTES)
-                            print(f"\n☕ Fin del lote. Tomando un descanso de {batch_break_minutes:.1f} minutos...")
-                            await asyncio.sleep(batch_break_minutes * 60)
-                            print("👍 Descanso finalizado. Reanudando...")
+        if not source_map:
+            raise ValueError("❌ No se ha configurado ningún canal de origen (ej. MOVIES_SOURCE_IDS o MIXED_SOURCE_IDS).")
 
-                    except FloodWaitError as e:
-                        # --- MANEJO DE ERRORES CAUTELOSO ---
-                        extra_wait = random.uniform(10, 30)
-                        wait_time = e.seconds + extra_wait
-                        print(f"\n⏳ FloodWait. Telegram pide esperar {e.seconds}s. Esperaremos {wait_time:.0f}s por seguridad...")
-                        await asyncio.sleep(wait_time)
-                    except Exception as e:
-                        print(f"\n⚠️ Error procesando video ID {message.id}: {e}")
-                        await asyncio.sleep(15) # Pausa más larga en caso de error desconocido
+        sleep_seconds = int(os.environ.get('SLEEP_INTERVAL_SECONDS', 5 * 60 * 60))
 
-                if not is_sleep_time(): # Solo enviar footer si no nos detuvimos por modo noche
-                    await send_chapter_footer(client, dest_entity, channel_name, total_to_process)
-                    print(f"\n✅ Procesamiento de '{channel_name}' completado.")
+        return cls(
+            api_id=api_id,
+            api_hash=api_hash,
+            session_string=session_string,
+            destination_channels=dest_channels,
+            source_mapping=source_map,
+            sleep_interval_seconds=sleep_seconds
+        )
+
+# --- PARSER INTELIGENTE (MODIFICADO PARA DETECTAR MÁS CATEGORÍAS) ---
+class CaptionParser:
+    PATTERNS = {
+        'SERIES': [
+            r'\bS\d{1,2}E\d{1,3}\b', r'\b\d{1,2}x\d{1,3}\b', r'temporada\s*\d{1,2}', 
+            r'\bT\d{1,2}\b', r'capitulo\s*\d{1,3}', r'episodio\s*\d{1,3}', 
+            r'\bEp\s*\d{1,3}\b', r'\bCap\s*\d{1,3}\b'
+        ],
+        'ANIME': [
+            r'sub\s*español', r'subtitulado'
+        ],
+        'DORAMAS': [
+            r'\b(k-drama|c-drama|j-drama|dorama)\b'
+        ]
+    }
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        text = text.encode('ascii', 'ignore').decode('ascii')
+        text = re.sub(r'http\S+|www.\S+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    @staticmethod
+    def classify_and_parse(caption: str) -> Tuple[str, str, Optional[str], Optional[str]]:
+        if not caption:
+            return "UNCLASSIFIED", "Video sin título", None, None
+
+        text_lower = caption.lower()
+        detected_category = "MOVIES"
+
+        for category, patterns in CaptionParser.PATTERNS.items():
+            for pattern in patterns:
+                if re.search(pattern, text_lower, re.IGNORECASE):
+                    detected_category = category
+                    break
+            if detected_category != "MOVIES":
+                break
+        
+        clean_caption = CaptionParser._clean_text(caption)
+        quality_match = re.search(r'\[?\b(4k|2160p|1080p|720p|480p|HD|HQ|WEB-DL|WEBRip|BluRay|BRRip|HDRip)\b\]?', clean_caption, re.IGNORECASE)
+        quality = quality_match.group(1).upper() if quality_match else None
+        if quality_match: clean_caption = clean_caption.replace(quality_match.group(0), '')
+
+        year_match = re.search(r'\b(19[89]\d|20\d{2})\b', clean_caption)
+        year = year_match.group(0) if year_match else None
+        if year_match: clean_caption = clean_caption.replace(year_match.group(0), '')
+        
+        title = clean_caption.strip('()[]{}-_. ').replace('  ', ' ')
+        title = title.split('\n')[0].strip()
+        if not title: title = "Título no detectado"
+
+        return detected_category, title, quality, year
+
+# --- GESTOR DE ESTADO (sin cambios) ---
+class StateManager:
+    def __init__(self, file_path: str = 'processed_state.json'):
+        self.file_path = file_path
+        self.state = self._load()
+    def _load(self):
+        try:
+            with open(self.file_path, 'r') as f:
+                data = json.load(f)
+                data.setdefault('last_processed_ids', {})
+                data.setdefault('processed_signatures', [])
+                data['last_processed_ids'] = {int(k): v for k, v in data['last_processed_ids'].items()}
+                return data
+        except (FileNotFoundError, json.JSONDecodeError):
+            logging.info("No se encontró un archivo de estado. Creando uno nuevo.")
+            return {'last_processed_ids': {}, 'processed_signatures': []}
+    def _save(self):
+        with open(self.file_path, 'w') as f: json.dump(self.state, f, indent=4)
+    def get_last_message_id(self, chat_id: int) -> int: return self.state['last_processed_ids'].get(chat_id, 0)
+    def update_last_message_id(self, chat_id: int, message_id: int):
+        self.state['last_processed_ids'][chat_id] = message_id
+        self._save()
+    def has_signature(self, signature: str) -> bool: return signature in self.state['processed_signatures']
+    def add_signature(self, signature: str):
+        self.state['processed_signatures'].append(signature)
+        self._save()
+
+# --- CLASE FORWARDER (LÓGICA DE ENRUTAMIENTO PRINCIPAL) ---
+class Forwarder:
+    def __init__(self, config: Config, state: StateManager):
+        self.config = config
+        self.state = state
+        self.client = TelegramClient(StringSession(config.session_string), config.api_id, config.api_hash)
+        self.dest_entities = {}
+
+    @staticmethod
+    def _is_video(message: Message) -> bool:
+        if message.video: return True
+        if message.document and message.document.size > 20 * 1024 * 1024:
+            if any(k in message.document.mime_type for k in ['video', 'x-matroska']):
+                return True
+        return False
+
+    @staticmethod
+    def _create_signature(message: Message, parsed_title: str) -> str:
+        file_size = message.document.size if message.document else message.video.size
+        duration_attr = next((attr for attr in getattr(message.video or message.document, 'attributes', []) if hasattr(attr, 'duration')), None)
+        duration = duration_attr.duration if duration_attr else 0
+        normalized_title = re.sub(r'\W+', '', parsed_title).lower()
+        return f"{normalized_title}-{file_size}-{duration}"
+
+    async def _process_channel(self, source_entity: Channel):
+        source_id = source_entity.id
+        source_category = self.config.source_mapping.get(source_id, "MIXED")
+        last_message_id = self.state.get_last_message_id(source_id)
+        logging.info(f"🎞️  Escaneando '{source_entity.title}' (Cat: {source_category}) desde ID: {last_message_id}...")
+        
+        videos_processed = 0
+        
+        async for message in self.client.iter_messages(source_entity, min_id=last_message_id):
+            if not self._is_video(message):
+                self.state.update_last_message_id(source_id, message.id)
+                continue
+
+            original_caption = message.text or ""
+            detected_category, parsed_title, quality, year = CaptionParser.classify_and_parse(original_caption)
             
-            print("\n" + "="*60); print("✅ ¡Ciclo completado!"); save_processed_videos(processed_videos)
-            print(f"💾 Estado guardado. {len(processed_videos)} videos en total procesados. Esperando próximo ciclo activo...")
-            await asyncio.sleep(60) # Espera 1 minuto antes de iniciar el siguiente gran ciclo (o chequear si es hora de dormir)
+            signature = self._create_signature(message, parsed_title)
+            if self.state.has_signature(signature):
+                logging.info(f"  -> ⏭️  Duplicado por firma: '{parsed_title}'.")
+                self.state.update_last_message_id(source_id, message.id)
+                continue
+            
+            final_category = "UNCLASSIFIED"
+            if source_category != "MIXED":
+                final_category = source_category
+            else:
+                final_category = detected_category
+            
+            if final_category == "UNCLASSIFIED":
+                final_category = "MIXED_UNSORTED"
+
+            new_caption_parts = [parsed_title]
+            if quality: new_caption_parts.append(f"[{quality}]")
+            if year: new_caption_parts.append(f"[{year}]")
+            new_caption = " ".join(new_caption_parts)
+
+            dest_entity = self.dest_entities.get(final_category.upper())
+            if not dest_entity:
+                logging.warning(f"  -> ⚠️ No se encontró un destino para la categoría '{final_category}'. Saltando.")
+                self.state.update_last_message_id(source_id, message.id)
+                continue
+            
+            logging.info(f"  -> 📥 '{parsed_title}' -> Cat: [{final_category}] -> Enviando a '{getattr(dest_entity, 'title', 'N/A')}'")
+            
+            try:
+                await self.client.send_file(dest_entity, file=message, caption=new_caption)
+                self.state.add_signature(signature)
+                videos_processed += 1
+            except FloodWaitError as e:
+                logging.warning(f"⏳ Flood wait. Durmiendo por {e.seconds + 5} seg.")
+                await asyncio.sleep(e.seconds + 5)
+            except Exception as e:
+                logging.error(f"⚠️ Error enviando video ID {message.id}: {e}")
+                await asyncio.sleep(5)
+            
+            self.state.update_last_message_id(source_id, message.id)
+
+        if videos_processed > 0:
+            logging.info(f"✅ Escaneo de '{source_entity.title}' completado. {videos_processed} videos nuevos procesados.")
+        return videos_processed
+
+    async def run(self):
+        await self.client.start()
+        me = await self.client.get_me()
+        logging.info(f"🚀 Cliente conectado como: {me.first_name}")
+
+        logging.info("📡 Verificando y cargando entidades de destino...")
+        for category, dest_id in self.config.destination_channels.items():
+            try:
+                entity = await self.client.get_entity(dest_id)
+                self.dest_entities[category.upper()] = entity
+                logging.info(f"  -> ✅ Destino '{category}': '{getattr(entity, 'title', dest_id)}'")
+            except Exception as e:
+                logging.error(f"❌ FATAL: No se pudo encontrar el canal de destino para {category} ({dest_id}). Error: {e}")
+                return
+
+        source_entities = []
+        logging.info("📡 Verificando canales de origen...")
+        source_ids_to_check = list(self.config.source_mapping.keys())
+        for source_id in source_ids_to_check:
+            try:
+                entity = await self.client.get_entity(source_id)
+                source_entities.append(entity)
+                logging.info(f"  -> ✅ Origen '{getattr(entity, 'title', source_id)}' (Cat: {self.config.source_mapping[source_id]})")
+            except Exception as e:
+                logging.warning(f"  -> ⚠️  ADVERTENCIA: No se pudo encontrar el origen {source_id}. Se omitirá. Error: {e}")
+        
+        if not source_entities:
+            logging.error("❌ No se encontró ningún canal de origen válido. Saliendo.")
+            return
+
+        while True:
+            logging.info("="*50)
+            logging.info(f"🔄 Iniciando nuevo ciclo de escaneo: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            total_processed = 0
+            for source_entity in source_entities:
+                total_processed += await self._process_channel(source_entity)
+            logging.info(f"✅ Ciclo completado. Total de videos nuevos: {total_processed}")
+            logging.info(f"😴 Durmiendo por {self.config.sleep_interval_seconds / 3600:.1f} horas...")
+            await asyncio.sleep(self.config.sleep_interval_seconds)
+
+async def main():
+    try:
+        config = Config.from_env()
+        state = StateManager()
+        forwarder = Forwarder(config, state)
+        await forwarder.run()
+    except (ValueError, Exception) as e:
+        logging.error(f"🔥 Error fatal al iniciar el bot: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
