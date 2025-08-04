@@ -20,7 +20,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# --- CLASE DE CONFIGURACIÓN (MODIFICADA PARA CICLOS DE TRABAJO/DESCANSO) ---
+# --- CLASE DE CONFIGURACIÓN (CON PAUSA DE ENVÍO CONFIGURABLE) ---
 @dataclass
 class Config:
     api_id: int
@@ -29,10 +29,11 @@ class Config:
     destination_channels: Dict[str, int]
     source_mapping: Dict[int, str]
     
-    # Nuevas variables de tiempo
+    # Variables de tiempo
     work_duration_seconds: int
     sleep_duration_seconds: int
     scan_interval_seconds: int
+    send_interval_seconds: int # Nueva pausa entre envíos
 
     @classmethod
     def from_env(cls):
@@ -45,7 +46,7 @@ class Config:
         except ValueError:
             raise ValueError("❌ API_ID debe ser un número entero.")
 
-        # Cargar destinos (sin cambios)
+        # Cargar destinos
         dest_channels = {}
         CATEGORIES = ['MOVIES', 'SERIES', 'ANIME', 'DORAMAS', 'RETRO_TV', 'MIXED_UNSORTED']
         for category in CATEGORIES:
@@ -57,7 +58,7 @@ class Config:
         if not dest_channels or 'MIXED_UNSORTED' not in dest_channels:
             raise ValueError("❌ Faltan canales de destino. 'MIXED_UNSORTED_DEST_ID' es obligatorio.")
 
-        # Cargar orígenes (sin cambios)
+        # Cargar orígenes
         source_map = {}
         SOURCE_CATEGORIES = ['MOVIES', 'SERIES', 'ANIME', 'DORAMAS', 'RETRO_TV', 'MIXED']
         for category in SOURCE_CATEGORIES:
@@ -71,22 +72,23 @@ class Config:
         if not source_map:
             raise ValueError("❌ No se ha configurado ningún canal de origen.")
 
-        # Cargar nueva configuración de tiempo
-        work_minutes = int(os.environ.get('WORK_DURATION_MINUTES', 120)) # 2 horas por defecto
-        sleep_minutes = int(os.environ.get('SLEEP_DURATION_MINUTES', 60)) # 1 hora por defecto
-        scan_interval_sec = int(os.environ.get('SCAN_INTERVAL_SECONDS', 60)) # 1 minuto por defecto
+        # Cargar configuración de tiempo
+        work_minutes = int(os.environ.get('WORK_DURATION_MINUTES', 120))
+        sleep_minutes = int(os.environ.get('SLEEP_DURATION_MINUTES', 60))
+        scan_interval_sec = int(os.environ.get('SCAN_INTERVAL_SECONDS', 60))
+        send_interval_sec = int(os.environ.get('SEND_INTERVAL_SECONDS', 3)) # Pausa por defecto de 3 segundos
 
         return cls(
             api_id=api_id, api_hash=api_hash, session_string=session_string,
             destination_channels=dest_channels, source_mapping=source_map,
             work_duration_seconds=work_minutes * 60,
             sleep_duration_seconds=sleep_minutes * 60,
-            scan_interval_seconds=scan_interval_sec
+            scan_interval_seconds=scan_interval_sec,
+            send_interval_seconds=send_interval_sec
         )
 
-# --- CLASES CaptionParser y StateManager (SIN CAMBIOS) ---
+# --- PARSER INTELIGENTE (CON DETECCIÓN DE ANIME MEJORADA) ---
 class CaptionParser:
-    # ... (código idéntico al anterior) ...
     PATTERNS = {
         'SERIES': [
             r'\bS\d{1,2}E\d{1,3}\b', r'\b\d{1,2}x\d{1,3}\b', r'temporada\s*\d{1,2}', 
@@ -94,12 +96,15 @@ class CaptionParser:
             r'\bEp\s*\d{1,3}\b', r'\bCap\s*\d{1,3}\b'
         ],
         'ANIME': [
-            r'sub\s*español', r'subtitulado'
+            r'\banime\b',           # <-- MEJORA 1: Busca la palabra "anime"
+            r'sub\s*español', 
+            r'subtitulado'
         ],
         'DORAMAS': [
             r'\b(k-drama|c-drama|j-drama|dorama)\b'
         ]
     }
+    # ... (el resto de la clase no cambia) ...
     @staticmethod
     def _clean_text(text: str) -> str:
         text = text.encode('ascii', 'ignore').decode('ascii')
@@ -124,8 +129,9 @@ class CaptionParser:
         title = clean_caption.strip('()[]{}-_. ').replace('  ', ' '); title = title.split('\n')[0].strip()
         if not title: title = "Título no detectado"
         return detected_category, title, quality, year
+
+# --- GESTOR DE ESTADO (sin cambios) ---
 class StateManager:
-    # ... (código idéntico al anterior) ...
     def __init__(self, file_path: str = 'processed_state.json'): self.file_path = file_path; self.state = self._load()
     def _load(self):
         try:
@@ -141,9 +147,8 @@ class StateManager:
     def has_signature(self, signature: str) -> bool: return signature in self.state['processed_signatures']
     def add_signature(self, signature: str): self.state['processed_signatures'].append(signature); self._save()
 
-# --- CLASE FORWARDER (CON NUEVA LÓGICA DE CICLOS) ---
+# --- CLASE FORWARDER (CON PAUSA DE ENVÍO MEJORADA) ---
 class Forwarder:
-    # _is_video, _create_signature y _process_channel son idénticos al anterior
     def __init__(self, config: Config, state: StateManager):
         self.config = config
         self.state = state
@@ -162,6 +167,7 @@ class Forwarder:
         duration = duration_attr.duration if duration_attr else 0
         normalized_title = re.sub(r'\W+', '', parsed_title).lower()
         return f"{normalized_title}-{file_size}-{duration}"
+
     async def _process_channel(self, source_entity: Channel):
         source_id = source_entity.id
         source_category = self.config.source_mapping.get(source_id, "MIXED")
@@ -174,7 +180,7 @@ class Forwarder:
             signature = self._create_signature(message, parsed_title)
             if self.state.has_signature(signature):
                 self.state.update_last_message_id(source_id, message.id); continue
-            final_category = "MIXED_UNSORTED"
+            final_category = "UNCLASSIFIED"
             if source_category != "MIXED": final_category = source_category
             else: final_category = "UNCLASSIFIED" if not original_caption else detected_category
             if final_category == "UNCLASSIFIED": final_category = "MIXED_UNSORTED"
@@ -185,20 +191,17 @@ class Forwarder:
             try:
                 await self.client.send_file(dest_entity, file=message, caption=new_caption)
                 self.state.add_signature(signature); videos_processed += 1
-                await asyncio.sleep(1)
+                # --- MEJORA 2: Pausa configurable para ser más "amable" con la API ---
+                await asyncio.sleep(self.config.send_interval_seconds)
             except FloodWaitError as e: logging.warning(f"⏳ Flood wait. Durmiendo por {e.seconds + 5} seg."); await asyncio.sleep(e.seconds + 5)
             except Exception as e: logging.error(f"⚠️ Error enviando video ID {message.id}: {e}"); await asyncio.sleep(5)
             self.state.update_last_message_id(source_id, message.id)
         return videos_processed
 
     async def run(self):
-        """ Bucle principal con ciclo de trabajo/descanso. """
         await self.client.start()
         me = await self.client.get_me()
         logging.info(f"🚀 Cliente conectado como: {me.first_name}")
-
-        # Cargar entidades de destino y origen (sin cambios)
-        # ... (código idéntico al anterior) ...
         logging.info("📡 Verificando y cargando entidades de destino...")
         for category, dest_id in self.config.destination_channels.items():
             try:
@@ -218,34 +221,26 @@ class Forwarder:
                 logging.warning(f"  -> ⚠️  ADVERTENCIA: No se pudo encontrar el origen {source_id}. Se omitirá. Error: {e}")
         if not source_entities: logging.error("❌ No se encontró ningún canal de origen válido. Saliendo."); return
 
-        # --- NUEVO BUCLE PRINCIPAL ---
+        # Bucle principal de trabajo/descanso
         while True:
-            # --- FASE DE TRABAJO ---
             logging.info("="*50)
             logging.info(f"✅ INICIO del ciclo de trabajo de {self.config.work_duration_seconds / 60:.0f} minutos.")
             work_start_time = time.time()
             work_end_time = work_start_time + self.config.work_duration_seconds
-
             while time.time() < work_end_time:
-                scan_start_time = time.time()
                 total_processed_in_scan = 0
                 for source_entity in source_entities:
                     total_processed_in_scan += await self._process_channel(source_entity)
-                
                 if total_processed_in_scan > 0:
                     logging.info(f"✔️ Escaneo completado. {total_processed_in_scan} videos nuevos encontrados.")
                 else:
                     logging.info("✔️ Escaneo completado. No se encontraron videos nuevos.")
-
-                # Pausa corta entre escaneos para no saturar la API
                 remaining_time = work_end_time - time.time()
                 if remaining_time > 0:
-                    # Espera el intervalo de escaneo, o el tiempo que quede si es menor
                     wait_time = min(self.config.scan_interval_seconds, remaining_time)
                     logging.info(f"   -> Pausa corta de {wait_time:.0f}s. Tiempo de trabajo restante: {remaining_time / 60:.1f} min.")
                     await asyncio.sleep(wait_time)
             
-            # --- FASE DE DESCANSO ---
             logging.info("="*50)
             logging.info(f"🛑 FIN del ciclo de trabajo.")
             logging.info(f"😴 Iniciando período de descanso de {self.config.sleep_duration_seconds / 60:.0f} minutos.")
